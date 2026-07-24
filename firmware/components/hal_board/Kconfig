@@ -49,10 +49,11 @@ menu "MooBot Board"
 
         config MOO_LCD_INVERT_COLOR
             bool "Invert panel colors"
+            default y if MOO_LCD_ILI9342_INIT
             default n
             help
-                Some clone panels need INVON. Toggle if image renders negative
-                (dark UI shows white background).
+                ILI9342-class glass expects INVON. Toggle if image renders
+                negative (dark UI shows white background).
 
         config MOO_LCD_SWAP_XY
             bool "Swap X/Y axes"
@@ -84,6 +85,18 @@ menu "MooBot Board"
         config MOO_PIN_TOUCH_IRQ
             int "T_IRQ GPIO"
             default 21
+
+    endmenu
+
+    menu "RTC (DS3231, I2C)"
+
+        config MOO_PIN_I2C_SDA
+            int "I2C SDA GPIO"
+            default 4
+
+        config MOO_PIN_I2C_SCL
+            int "I2C SCL GPIO"
+            default 5
 
     endmenu
 

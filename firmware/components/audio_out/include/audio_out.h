@@ -24,6 +24,9 @@ esp_err_t audio_out_tone(float f0_hz, float f1_hz, uint32_t duration_ms, float a
 /* Two-chirp "happy coo" used on head pat. */
 esp_err_t audio_out_pat_sound(void);
 
+/* Two falling chirps — reminder alert. */
+esp_err_t audio_out_alert_sound(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1,0 +1,7 @@
+# MooBot dev partition table — 16MB flash (N16R8)
+# Name,    Type, SubType, Offset,  Size
+nvs,       data, nvs,     0x9000,  0x6000
+phy_init,  data, phy,     0xf000,  0x1000
+factory,   app,  factory, 0x10000, 14M
+# Full uncompressed asset set for dev. Production (8MB flash) requires
+# RLE-compressed assets — do NOT copy this table to the production build.

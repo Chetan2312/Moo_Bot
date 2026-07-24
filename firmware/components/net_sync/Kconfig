@@ -1,0 +1,15 @@
+menu "MooBot Network"
+
+    config MOO_WIFI_SSID
+        string "WiFi SSID (dev; BLE provisioning replaces this)"
+        default ""
+
+    config MOO_WIFI_PASS
+        string "WiFi password"
+        default ""
+
+    config MOO_SNTP_SERVER
+        string "SNTP server"
+        default "pool.ntp.org"
+
+endmenu

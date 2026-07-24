@@ -1,0 +1,9 @@
+menu "MooBot Face"
+
+    config MOO_FACE_SPRITES
+        bool "Sprite-sheet face (persona_assets)"
+        default y
+        help
+            Off = procedural LVGL-primitive face (pre-asset bringup fallback).
+
+endmenu

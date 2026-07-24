@@ -3,6 +3,7 @@
 #include "driver/spi_master.h"
 #include "driver/ledc.h"
 #include "driver/gpio.h"
+#include "driver/i2c_master.h"
 #include "esp_check.h"
 #include "esp_lcd_ili9341.h"
 #include "esp_timer.h"
@@ -165,24 +166,34 @@ esp_err_t board_backlight_set(uint8_t percent)
 static QueueHandle_t s_pat_queue;
 static board_pat_cb_t s_pat_cb;
 static void *s_pat_ctx;
+static int64_t s_pat_press_us;
 
 static void IRAM_ATTR pat_isr(void *arg)
 {
     (void)arg;
-    const uint8_t evt = 1;
+    const int64_t now = esp_timer_get_time();
+    if (gpio_get_level(CONFIG_MOO_PIN_PAT)) {
+        s_pat_press_us = now;                       /* press edge */
+        return;
+    }
+    /* release edge: report hold duration */
+    const uint32_t held_ms = (uint32_t)((now - s_pat_press_us) / 1000);
     BaseType_t hp_woken = pdFALSE;
-    xQueueSendFromISR(s_pat_queue, &evt, &hp_woken);
+    xQueueSendFromISR(s_pat_queue, &held_ms, &hp_woken);
     portYIELD_FROM_ISR(hp_woken);
 }
 
 static void pat_task(void *arg)
 {
     (void)arg;
-    uint8_t evt;
+    uint32_t held_ms;
     int64_t last_us = 0;
 
     for (;;) {
-        if (xQueueReceive(s_pat_queue, &evt, portMAX_DELAY) != pdTRUE) {
+        if (xQueueReceive(s_pat_queue, &held_ms, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        if (held_ms < 30) {                          /* contact bounce */
             continue;
         }
         const int64_t now = esp_timer_get_time();
@@ -191,7 +202,7 @@ static void pat_task(void *arg)
         }
         last_us = now;
         if (s_pat_cb) {
-            s_pat_cb(s_pat_ctx);
+            s_pat_cb(s_pat_ctx, held_ms);
         }
     }
 }
@@ -202,14 +213,14 @@ esp_err_t board_pat_init(board_pat_cb_t cb, void *ctx)
     s_pat_cb = cb;
     s_pat_ctx = ctx;
 
-    s_pat_queue = xQueueCreate(4, sizeof(uint8_t));
+    s_pat_queue = xQueueCreate(4, sizeof(uint32_t));
     ESP_RETURN_ON_FALSE(s_pat_queue, ESP_ERR_NO_MEM, TAG, "pat queue");
 
     const gpio_config_t cfg = {
         .pin_bit_mask = 1ULL << CONFIG_MOO_PIN_PAT,
         .mode = GPIO_MODE_INPUT,
         .pull_down_en = GPIO_PULLDOWN_ENABLE,   /* TTP223 idle low, active high */
-        .intr_type = GPIO_INTR_POSEDGE,
+        .intr_type = GPIO_INTR_ANYEDGE,         /* press + release for duration */
     };
     ESP_RETURN_ON_ERROR(gpio_config(&cfg), TAG, "pat gpio cfg");
 
@@ -263,4 +274,72 @@ esp_err_t board_led_off(void)
 {
     ESP_RETURN_ON_FALSE(s_strip, ESP_ERR_INVALID_STATE, TAG, "led not init");
     return led_strip_clear(s_strip);
+}
+
+/* ---------------- DS3231 RTC ---------------- */
+
+#define DS3231_ADDR 0x68
+
+static i2c_master_dev_handle_t s_rtc_dev;
+
+static uint8_t bcd2dec(uint8_t v) { return (v >> 4) * 10 + (v & 0x0F); }
+static uint8_t dec2bcd(uint8_t v) { return ((v / 10) << 4) | (v % 10); }
+
+esp_err_t board_rtc_init(void)
+{
+    const i2c_master_bus_config_t bus_cfg = {
+        .i2c_port = I2C_NUM_0,
+        .sda_io_num = CONFIG_MOO_PIN_I2C_SDA,
+        .scl_io_num = CONFIG_MOO_PIN_I2C_SCL,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,   /* module has its own too */
+    };
+    i2c_master_bus_handle_t bus;
+    ESP_RETURN_ON_ERROR(i2c_new_master_bus(&bus_cfg, &bus), TAG, "i2c bus");
+
+    const i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = DS3231_ADDR,
+        .scl_speed_hz = 100000,
+    };
+    ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(bus, &dev_cfg, &s_rtc_dev),
+                        TAG, "rtc add dev");
+    ESP_LOGI(TAG, "DS3231 on sda=%d scl=%d", CONFIG_MOO_PIN_I2C_SDA, CONFIG_MOO_PIN_I2C_SCL);
+    return ESP_OK;
+}
+
+esp_err_t board_rtc_get(struct tm *out)
+{
+    ESP_RETURN_ON_FALSE(s_rtc_dev && out, ESP_ERR_INVALID_STATE, TAG, "rtc get");
+    const uint8_t reg = 0x00;
+    uint8_t b[7];
+    ESP_RETURN_ON_ERROR(i2c_master_transmit_receive(s_rtc_dev, &reg, 1, b, sizeof(b),
+                                                    pdMS_TO_TICKS(100)),
+                        TAG, "rtc read");
+    out->tm_sec = bcd2dec(b[0] & 0x7F);
+    out->tm_min = bcd2dec(b[1] & 0x7F);
+    out->tm_hour = bcd2dec(b[2] & 0x3F);        /* 24h mode assumed */
+    out->tm_wday = (b[3] & 0x07) - 1;           /* DS3231 dow 1-7 */
+    out->tm_mday = bcd2dec(b[4] & 0x3F);
+    out->tm_mon = bcd2dec(b[5] & 0x1F) - 1;
+    out->tm_year = bcd2dec(b[6]) + 100;         /* years since 1900, base 2000 */
+    out->tm_isdst = 0;
+    return ESP_OK;
+}
+
+esp_err_t board_rtc_set(const struct tm *t)
+{
+    ESP_RETURN_ON_FALSE(s_rtc_dev && t, ESP_ERR_INVALID_STATE, TAG, "rtc set");
+    const uint8_t buf[8] = {
+        0x00,
+        dec2bcd(t->tm_sec),
+        dec2bcd(t->tm_min),
+        dec2bcd(t->tm_hour),
+        dec2bcd((uint8_t)(t->tm_wday + 1)),
+        dec2bcd(t->tm_mday),
+        dec2bcd((uint8_t)(t->tm_mon + 1)),
+        dec2bcd((uint8_t)(t->tm_year - 100)),
+    };
+    return i2c_master_transmit(s_rtc_dev, buf, sizeof(buf), pdMS_TO_TICKS(100));
 }

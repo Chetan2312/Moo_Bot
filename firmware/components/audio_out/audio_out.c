@@ -89,3 +89,10 @@ esp_err_t audio_out_pat_sound(void)
     vTaskDelay(pdMS_TO_TICKS(35));
     return audio_out_tone(1000.0f, 1900.0f, 90, 0.8f);
 }
+
+esp_err_t audio_out_alert_sound(void)
+{
+    ESP_RETURN_ON_ERROR(audio_out_tone(1600.0f, 1000.0f, 150, 0.8f), TAG, "alert1");
+    vTaskDelay(pdMS_TO_TICKS(70));
+    return audio_out_tone(1600.0f, 1000.0f, 150, 0.8f);
+}
