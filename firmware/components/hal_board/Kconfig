@@ -76,15 +76,28 @@ menu "MooBot Board"
 
     endmenu
 
-    menu "Touch (XPT2046, demo 2+)"
+    menu "Touch (XPT2046)"
 
         config MOO_PIN_TOUCH_CS
             int "T_CS GPIO"
             default 14
 
         config MOO_PIN_TOUCH_IRQ
-            int "T_IRQ GPIO"
+            int "T_IRQ GPIO (-1 if unwired)"
+            range -1 48
             default 21
+
+        config MOO_TOUCH_SWAP_XY
+            bool "Swap touch X/Y (match landscape panel)"
+            default y
+
+        config MOO_TOUCH_MIRROR_X
+            bool "Mirror touch X"
+            default y
+
+        config MOO_TOUCH_MIRROR_Y
+            bool "Mirror touch Y"
+            default n
 
     endmenu
 
@@ -107,8 +120,12 @@ menu "MooBot Board"
             default 6
 
         config MOO_PAT_COOLDOWN_MS
-            int "Pat debounce/cooldown ms"
-            default 400
+            int "Pat contact-debounce ms (small! gesture grouping is in main)"
+            default 60
+            help
+                Only rejects contact bounce between distinct taps. Must stay
+                small (<100) or rapid multi-taps get dropped before the
+                gesture task can count them.
 
     endmenu
 
@@ -124,31 +141,131 @@ menu "MooBot Board"
 
     endmenu
 
-    menu "Audio (I2S)"
+    menu "Audio out"
+
+        choice MOO_AUDIO_BACKEND
+            prompt "Output backend"
+            default MOO_AUDIO_BACKEND_LEDC
+            help
+                I2S drives a MAX98357A-class DAC+amp: true 16-bit PCM over
+                three wires. Cleanest output, needs the amp board.
+
+                PDM drives the same single-wire analog speaker module as
+                LEDC, but through the S3's hardware sigma-delta modulator:
+                real 16-bit PCM on ONE pin, so WAV/voice plays without any
+                new hardware. Put an RC low-pass on SIGNAL (1 kOhm + 10 nF,
+                ~16 kHz) — the raw PDM carrier is in the MHz.
+
+                LEDC drives that module with a PWM carrier: square-wave
+                tones only. The ESP32-S3 has no DAC, so PWM was the only
+                analog-ish option before PDM. Melodies sound identical in
+                pitch and timing; timbre is harsher and there is no PCM
+                path. Kept as the fallback if PDM misbehaves.
+
+            config MOO_AUDIO_BACKEND_I2S
+                bool "I2S DAC + amp (MAX98357A)"
+
+            config MOO_AUDIO_BACKEND_PDM
+                bool "PDM sigma-delta into analog speaker module"
+
+            config MOO_AUDIO_BACKEND_LEDC
+                bool "LEDC PWM into analog speaker module (tones only)"
+        endchoice
+
+        config MOO_PIN_SPEAKER_PWM
+            int "Speaker module SIGNAL GPIO"
+            depends on MOO_AUDIO_BACKEND_LEDC || MOO_AUDIO_BACKEND_PDM
+            default 7
+            help
+                Same wire for both single-pin backends: LEDC drives it with
+                a PWM carrier, PDM with a sigma-delta bitstream.
+
+                Deliberately not 15 — that keeps 15/17/18 contiguous for a
+                1-bit SDMMC card slot later.
 
         config MOO_PIN_I2S_AMP_BCLK
             int "MAX98357A BCLK GPIO"
+            depends on MOO_AUDIO_BACKEND_I2S
             default 40
 
         config MOO_PIN_I2S_AMP_LRCLK
             int "MAX98357A LRCLK GPIO"
+            depends on MOO_AUDIO_BACKEND_I2S
             default 41
 
         config MOO_PIN_I2S_AMP_DIN
             int "MAX98357A DIN GPIO"
+            depends on MOO_AUDIO_BACKEND_I2S
             default 42
 
+    endmenu
+
+    menu "Microphone (INMP441, I2S)"
+
+        config MOO_MIC_ENABLE
+            bool "Enable INMP441 microphone"
+            default y
+
         config MOO_PIN_I2S_MIC_SCK
-            int "ICS-43434 SCK GPIO (parked)"
+            int "INMP441 SCK GPIO"
+            depends on MOO_MIC_ENABLE
             default 38
 
         config MOO_PIN_I2S_MIC_WS
-            int "ICS-43434 WS GPIO (parked)"
+            int "INMP441 WS GPIO"
+            depends on MOO_MIC_ENABLE
             default 39
 
         config MOO_PIN_I2S_MIC_SD
-            int "ICS-43434 SD GPIO (parked)"
+            int "INMP441 SD GPIO"
+            depends on MOO_MIC_ENABLE
             default 47
+
+        config MOO_MIC_SAMPLE_RATE
+            int "Sample rate (Hz)"
+            depends on MOO_MIC_ENABLE
+            default 16000
+            help
+                16 kHz is what every on-device wake-word / command engine
+                wants. Raise only if you need >8 kHz of audio bandwidth.
+
+        config MOO_MIC_SLOT_RIGHT
+            bool "Mic on RIGHT I2S slot (L/R tied to VDD)"
+            depends on MOO_MIC_ENABLE
+            default n
+            help
+                INMP441 L/R tied to GND -> data in the LEFT slot; leave this
+                n. Tied to VDD -> RIGHT slot. If the level monitor reports a
+                dead -90 dBFS, flip this before suspecting the wiring.
+
+        config MOO_MIC_GAIN_SHIFT
+            int "Digital gain (left-shift bits)"
+            depends on MOO_MIC_ENABLE
+            range 0 12
+            default 4
+            help
+                Sensitivity is -26 dBFS @ 94 dB SPL, so desk-level speech
+                lands near -55 dBFS and looks like silence in raw int16.
+                Each bit is +6 dB; 4 = +24 dB. Too much clips — watch the
+                peak figure in the monitor log.
+
+        config MOO_MIC_VAD_MARGIN_DB
+            int "Voice detect margin above the noise floor (dB)"
+            depends on MOO_MIC_ENABLE
+            range 4 30
+            default 10
+            help
+                audio_in_record() measures the room's noise floor, then
+                treats anything this far above it as speech. Too low and a
+                fan starts recordings; too high and quiet speech is missed.
+
+        config MOO_MIC_MONITOR
+            bool "Start the bringup level-monitor task"
+            depends on MOO_MIC_ENABLE
+            default y
+            help
+                Logs RMS dBFS and peak every ~200 ms. Turn off once the mic
+                is verified.
 
     endmenu
 

@@ -1,3 +1,4 @@
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/time.h>
@@ -6,74 +7,255 @@
 #include "esp_log.h"
 #include "esp_lvgl_port.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
 
+#include "audio_in.h"
 #include "audio_out.h"
 #include "face_ui.h"
+#include "gemini.h"
 #include "hal_board.h"
 #include "net_sync.h"
-#include "reminder_store.h"
+#include "sfx.h"
 
 static const char *TAG = "main";
 
-#define LONG_PRESS_MS 600
+/* Bump on every flashed release. Printed at boot so a device in hand can be
+ * identified without reading its flash. */
+#define MOO_FW_VERSION "0.1.0"
 
-/* Runs in the pat task from hal_board — blocking audio is fine here.
- * Short tap: cycle face <-> clock screen.
- * Long press: ack pending reminder, else TEST-cycle emotions. */
-static void on_pat(void *ctx, uint32_t held_ms)
+/*
+ * Three screens, cycled with a double-tap of the head button:
+ *
+ *   face   Shivaansh's screen. Every touch plays the next cow animation and
+ *          its sound, straight away. No modes, no counting taps.
+ *   clock  time and date, auto-returns to the face after 30 s.
+ *   AI     tap to talk; ask for a story and the cow tells one.
+ *
+ * The touchscreen is deliberately instant while the head button keeps the
+ * multi-tap grouping. A toddler mashes the screen and gets a response per
+ * touch; navigation lives on the button where a 500 ms listen window costs
+ * nothing. Same input, same output, every time — that is the whole game at
+ * 18 months.
+ */
+
+#define MULTI_TAP_MS    500         /* grouping window, head button only */
+#define MAX_TAPS        2
+#define VOL_STEP        4
+
+typedef enum {
+    GEST_BUTTON_TAP,     /* head button — may be grouped into a double */
+    GEST_SCREEN_FACE,    /* touchscreen on the face screen — immediate */
+    GEST_HOLD_TICK,
+    GEST_HOLD_END,
+} gesture_kind_t;
+
+typedef struct { gesture_kind_t kind; uint32_t held; } gesture_msg_t;
+
+static QueueHandle_t s_gesture_q;
+
+/* "Hello Shivaansh", raw headerless mono s16le, embedded from
+ * main/assets/moo_test.pcm. The symbol is the filename with dots turned
+ * into underscores. MOO_CLIP_RATE_HZ must match the `ffmpeg -ar` it was
+ * made with — there is no header to read it from. */
+#define MOO_CLIP_RATE_HZ 22050
+
+extern const uint8_t moo_clip_start[] asm("_binary_moo_test_pcm_start");
+extern const uint8_t moo_clip_end[]   asm("_binary_moo_test_pcm_end");
+
+/* ---- the play cards ----------------------------------------------------
+ *
+ * Every frame here is already in flash: 11 cow animations x 9 frames. The
+ * greeting clip is card 0 so the first touch says his name. */
+
+typedef enum { CARD_CLIP, CARD_SFX } card_kind_t;
+
+typedef struct {
+    face_react_t react;
+    card_kind_t  kind;
+    sfx_id_t     sfx;
+    uint8_t      r, g, b;
+} play_card_t;
+
+static const play_card_t s_cards[] = {
+    { FACE_REACT_HAPPY,     CARD_CLIP, 0,             255, 200, 120 },
+    { FACE_REACT_PAT,       CARD_SFX,  SFX_MOO,       120, 255, 120 },
+    { FACE_REACT_EAT,       CARD_SFX,  SFX_MUNCH,     255, 200,  60 },
+    { FACE_REACT_CELEBRATE, CARD_SFX,  SFX_GIGGLE,    255, 120, 200 },
+    { FACE_REACT_TASK_DONE, CARD_SFX,  SFX_MOO_SHORT, 120, 200, 255 },
+    { FACE_REACT_WAKE,      CARD_SFX,  SFX_YAWN,      255, 160,  80 },
+};
+#define CARD_COUNT (sizeof(s_cards) / sizeof(s_cards[0]))
+
+static void play_card_next(void)
 {
-    (void)ctx;
+    static size_t idx;
+    const play_card_t *c = &s_cards[idx];
 
-    if (held_ms >= LONG_PRESS_MS) {
-        if (reminder_store_pending()) {
-            ESP_LOGI(TAG, "long press -> reminder ack");
-            reminder_store_ack();
-            board_led_off();
-            audio_out_tone(900.0f, 1300.0f, 80, 0.6f);
-        } else {
-            ESP_LOGI(TAG, "long press -> next screen");
-            face_ui_next_screen();
-        }
-        return;
-    }
+    board_led_set_all(c->r, c->g, c->b);
+    face_ui_react(c->react);            /* ignored if one is still running */
 
-    /* Short tap = pat. TEST: cycles all reactions until real triggers exist;
-     * product behavior is FACE_REACT_PAT only. */
-    static const face_react_t order[] = {
-        FACE_REACT_PAT, FACE_REACT_HAPPY, FACE_REACT_CELEBRATE,
-        FACE_REACT_SAD, FACE_REACT_SLEEPY, FACE_REACT_ALERT,
-        FACE_REACT_TASK_DONE, FACE_REACT_WAKE, FACE_REACT_EAT,
-    };
-    static const char *names[] = {
-        "pat", "happy", "celebrate", "sad", "sleepy",
-        "alert", "task_done", "wake", "eat",
-    };
-    static uint8_t ri;
-
-    if (face_ui_react(order[ri])) {
-        ESP_LOGI(TAG, "pat -> %s", names[ri]);
-        ri = (ri + 1) % (sizeof(order) / sizeof(order[0]));
-        board_led_set_all(255, 70, 130);
-        audio_out_pat_sound();
-        vTaskDelay(pdMS_TO_TICKS(400));
-        if (!reminder_store_pending()) {
-            board_led_off();
+    if (c->kind == CARD_CLIP) {
+        const size_t bytes = (size_t)(moo_clip_end - moo_clip_start);
+        if (audio_out_play_pcm(moo_clip_start, bytes, MOO_CLIP_RATE_HZ) != ESP_OK) {
+            audio_out_play(SND_HAPPY);  /* backend with no PCM path */
         }
     } else {
-        ESP_LOGI(TAG, "pat ignored (reaction in flight)");
+        sfx_play(c->sfx);
+    }
+
+    board_led_off();
+    idx = (idx + 1) % CARD_COUNT;
+}
+
+/* ---- AI screen ---------------------------------------------------------- */
+
+/* Feeds the listening meter. -55 dBFS reads as silence and -15 as loud,
+ * which is roughly the span of a person talking at a desk mic. */
+static uint8_t mic_level_pct(void)
+{
+    const float db = audio_in_level_dbfs();
+    float pct = (db + 55.0f) * (100.0f / 40.0f);
+    if (pct < 0.0f)   pct = 0.0f;
+    if (pct > 100.0f) pct = 100.0f;
+    return (uint8_t)pct;
+}
+
+/* Runs on the gemini task. The round trip is ~10 s, so showing nothing
+ * would read as a dead toy. */
+static void on_gemini_stage(gemini_stage_t st, const char *detail, void *ctx)
+{
+    (void)ctx;
+    switch (st) {
+    case GEMINI_STAGE_LISTENING:
+        ESP_LOGI(TAG, "story: listening");
+        board_led_set_all(80, 160, 255);
+        face_ui_ai_set_state(AI_LISTENING, "say something");
+        break;
+    case GEMINI_STAGE_THINKING:
+        ESP_LOGI(TAG, "story: thinking");
+        board_led_set_all(180, 120, 255);
+        face_ui_ai_set_state(AI_THINKING, "writing your story");
+        break;
+    case GEMINI_STAGE_SPEAKING:
+        ESP_LOGI(TAG, "story: speaking - %.120s", detail ? detail : "");
+        board_led_set_all(120, 255, 120);
+        face_ui_ai_set_state(AI_SPEAKING, NULL);
+        break;
+    case GEMINI_STAGE_DONE:
+        board_led_off();
+        face_ui_ai_set_state(AI_IDLE, NULL);
+        break;
+    case GEMINI_STAGE_FAILED:
+        ESP_LOGW(TAG, "story failed: %s", detail ? detail : "?");
+        board_led_off();
+        face_ui_ai_set_state(AI_FAILED, detail);
+        audio_out_play(SND_SAD);
+        break;
     }
 }
 
-/* Runs in the reminder task. */
-static void on_reminder(const moo_reminder_t *r, void *ctx)
+/* Tap on the AI screen. Runs in the LVGL task; gemini_ask_story() only
+ * spawns a task, so this stays light. */
+static void on_ai_tap(void)
+{
+    if (!gemini_configured()) {
+        ESP_LOGW(TAG, "story: no API key (menuconfig -> MooBot Gemini)");
+        face_ui_ai_set_state(AI_FAILED, "no API key");
+        return;
+    }
+    if (gemini_busy()) {
+        return;                          /* already running; ignore */
+    }
+    const esp_err_t err = gemini_ask_story();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "story: %s", esp_err_to_name(err));
+        face_ui_ai_set_state(AI_FAILED, esp_err_to_name(err));
+    }
+}
+
+/* ---- gestures ----------------------------------------------------------- */
+
+static void gesture_task(void *arg)
+{
+    (void)arg;
+    static int vol_dir = +1;             /* first hold increases */
+    gesture_msg_t m;
+
+    for (;;) {
+        if (xQueueReceive(s_gesture_q, &m, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        switch (m.kind) {
+        case GEST_HOLD_TICK: {
+            const uint8_t pct = audio_out_volume_adjust(vol_dir * VOL_STEP);
+            face_ui_show_volume(pct);
+            continue;
+        }
+        case GEST_HOLD_END:
+            audio_out_volume_commit();
+            ESP_LOGI(TAG, "volume %d%%", audio_out_volume_get());
+            vol_dir = -vol_dir;          /* next hold goes the other way */
+            continue;
+
+        case GEST_SCREEN_FACE:
+            /* No grouping, no waiting — this is the toddler path. */
+            play_card_next();
+            xQueueReset(s_gesture_q);    /* mashing must not build a backlog */
+            continue;
+
+        case GEST_BUTTON_TAP:
+            break;
+        }
+
+        /* Head button: group a double-tap for screen changes. */
+        int taps = 1;
+        audio_out_tone(1500.0f, 1500.0f, 25, 0.4f);
+        while (taps < MAX_TAPS &&
+               xQueueReceive(s_gesture_q, &m, pdMS_TO_TICKS(MULTI_TAP_MS)) == pdTRUE) {
+            if (m.kind != GEST_BUTTON_TAP) {
+                break;
+            }
+            taps++;
+        }
+
+        if (taps >= 2) {
+            ESP_LOGI(TAG, "gesture: next screen");
+            audio_out_play(SND_SCREEN);
+            face_ui_next_screen();
+        } else if (!face_ui_on_ai_screen()) {
+            play_card_next();
+        }
+    }
+}
+
+/* Runs in hal_board's pat task. */
+static void on_pat(void *ctx, pat_event_t evt, uint32_t held_ms)
 {
     (void)ctx;
-    ESP_LOGI(TAG, "REMINDER: %s", r->text);
-    face_ui_react(FACE_REACT_ALERT);
-    board_led_set_all(255, 140, 0);        /* amber until acked */
-    audio_out_alert_sound();
+    gesture_msg_t m = { .held = held_ms };
+    switch (evt) {
+    case PAT_TAP:       m.kind = GEST_BUTTON_TAP; break;
+    case PAT_HOLD_TICK: m.kind = GEST_HOLD_TICK;  break;
+    case PAT_HOLD_END:  m.kind = GEST_HOLD_END;   break;
+    default: return;
+    }
+    xQueueSend(s_gesture_q, &m, 0);
+}
+
+/* Touchscreen on the face screen. Runs in the LVGL task, so hand the
+ * blocking audio to the gesture task. */
+static void on_face_tap(void)
+{
+    const gesture_msg_t m = { .kind = GEST_SCREEN_FACE, .held = 0 };
+    xQueueSend(s_gesture_q, &m, 0);
+}
+
+static void on_got_ip(void)
+{
+    ESP_LOGI(TAG, "network up — stories available");
 }
 
 static void system_time_from_rtc(void)
@@ -97,8 +279,8 @@ static void system_time_from_rtc(void)
                  t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
                  t.tm_hour, t.tm_min, t.tm_sec);
     } else {
-        /* Fresh/battery-dead RTC: seed from build timestamp (close enough,
-         * SNTP takes over once WiFi exists). __DATE__ = "Jul 23 2026". */
+        /* Fresh/battery-dead RTC: seed from the build timestamp. A 1970
+         * clock breaks TLS cert validation, which kills Gemini. */
         struct tm bt = { 0 };
         char mon[4] = { 0 };
         sscanf(__DATE__, "%3s %d %d", mon, &bt.tm_mday, &bt.tm_year);
@@ -107,45 +289,15 @@ static void system_time_from_rtc(void)
         bt.tm_mon = (int)(strstr(months, mon) - months) / 3;
         bt.tm_year -= 1900;
         const time_t bt_time = mktime(&bt);
+        const struct timeval tv = { .tv_sec = bt_time };
+        settimeofday(&tv, NULL);
         struct tm lt;
         localtime_r(&bt_time, &lt);
         mktime(&lt);                          /* normalize tm_wday */
-        if (board_rtc_set(&lt) == ESP_OK) {
-            const struct timeval tv = { .tv_sec = bt_time };
-            settimeofday(&tv, NULL);
-            ESP_LOGW(TAG, "DS3231 was unset — seeded from build time %s %s", __DATE__, __TIME__);
-        }
+        board_rtc_set(&lt);                   /* best-effort */
+        ESP_LOGW(TAG, "no valid RTC — seeded system time from build time %s %s",
+                 __DATE__, __TIME__);
     }
-}
-
-/* Waits for valid time (RTC at boot or SNTP async), then seeds the demo
- * reminder once. Self-deletes. */
-static void seed_demo_reminder_task(void *arg)
-{
-    (void)arg;
-    for (int i = 0; i < 90; i++) {
-        time_t now = time(NULL);
-        struct tm t;
-        localtime_r(&now, &t);
-        if (t.tm_year >= 124) {
-            if (reminder_store_count() == 0) {
-                const int total = t.tm_hour * 60 + t.tm_min + 2;
-                const moo_reminder_t demo = {
-                    .hh = (total / 60) % 24,
-                    .mm = total % 60,
-                    .days_mask = 0x7F,
-                    .enabled = true,
-                    .text = "demo: drink water",
-                };
-                reminder_store_add(&demo);
-                ESP_LOGI(TAG, "demo reminder at %02d:%02d (2 min from now)",
-                         demo.hh, demo.mm);
-            }
-            break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-    vTaskDelete(NULL);
 }
 
 void app_main(void)
@@ -156,6 +308,9 @@ void app_main(void)
         ESP_ERROR_CHECK(nvs_flash_init());
     }
 
+    ESP_LOGI(TAG, "MooBot firmware v%s (built %s %s)",
+             MOO_FW_VERSION, __DATE__, __TIME__);
+
     board_lcd_t lcd;
     ESP_ERROR_CHECK(board_lcd_init(&lcd));
 
@@ -165,7 +320,7 @@ void app_main(void)
     const lvgl_port_display_cfg_t disp_cfg = {
         .io_handle = lcd.io,
         .panel_handle = lcd.panel,
-        .buffer_size = CONFIG_MOO_LCD_H_RES * 40,
+        .buffer_size = CONFIG_MOO_LCD_H_RES * 20,
         .double_buffer = true,
         .hres = CONFIG_MOO_LCD_H_RES,
         .vres = CONFIG_MOO_LCD_V_RES,
@@ -177,6 +332,10 @@ void app_main(void)
         },
         .color_format = LV_COLOR_FORMAT_RGB565,
         .flags = {
+            /* Draw buffers stay in internal DMA RAM (stable SPI-LCD path);
+             * the halved buffer_size frees the ~25 KB internal RAM the
+             * WiFi/TLS path needs. PSRAM-DMA for the LCD caused intermittent
+             * "spi transmit (queue) color failed" + LVGL hangs. */
             .buff_dma = true,
             .swap_bytes = true,
         },
@@ -186,6 +345,24 @@ void app_main(void)
 
     ESP_ERROR_CHECK(board_backlight_set(100));
     face_ui_start(disp);
+
+    /* Must exist before touch or button can post to it. */
+    s_gesture_q = xQueueCreate(12, sizeof(gesture_msg_t));
+    ESP_ERROR_CHECK(s_gesture_q ? ESP_OK : ESP_ERR_NO_MEM);
+    xTaskCreate(gesture_task, "gesture", 4096, NULL, 5, NULL);
+
+    esp_lcd_touch_handle_t tp;
+    if (board_touch_init(&tp) == ESP_OK) {
+        const lvgl_port_touch_cfg_t touch_cfg = { .disp = disp, .handle = tp };
+        if (lvgl_port_add_touch(&touch_cfg) == NULL) {
+            ESP_LOGW(TAG, "touch indev add failed");
+        }
+        face_ui_set_tap_cb(on_face_tap);
+        face_ui_set_ai_tap_cb(on_ai_tap);
+        face_ui_set_level_source(mic_level_pct);
+    } else {
+        ESP_LOGW(TAG, "touch init failed (unwired?)");
+    }
 
     system_time_from_rtc();
 
@@ -197,15 +374,31 @@ void app_main(void)
     err = audio_out_init();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "audio init failed: %s", esp_err_to_name(err));
+    } else if (sfx_prewarm() != ESP_OK) {
+        ESP_LOGW(TAG, "sfx prewarm incomplete");
     }
-    ESP_ERROR_CHECK(board_pat_init(on_pat, NULL));
-    ESP_ERROR_CHECK(reminder_store_init(on_reminder, NULL));
+#if CONFIG_MOO_MIC_ENABLE
+    err = audio_in_init();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "mic init failed: %s", esp_err_to_name(err));
+    }
+#if CONFIG_MOO_MIC_MONITOR
+    else if (audio_in_start_monitor() != ESP_OK) {
+        ESP_LOGW(TAG, "mic monitor task not started");
+    }
+#endif
+#endif
 
-    err = net_sync_start();          /* SNTP fills system time async */
+    /* Not fatal without a key — the other two screens still work. */
+    gemini_init(on_gemini_stage, NULL);
+
+    ESP_ERROR_CHECK(board_pat_init(on_pat, NULL));
+
+    err = net_sync_start(on_got_ip);     /* WiFi + SNTP; Gemini needs both */
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "net_sync not started: %s", esp_err_to_name(err));
     }
-    xTaskCreate(seed_demo_reminder_task, "seed", 3072, NULL, 3, NULL);
 
-    ESP_LOGI(TAG, "demo3: face + clock + reminders (tap=screen, hold=emotion/ack)");
+    ESP_LOGI(TAG, "moo: touch face = play, button x2 = next screen "
+                  "(face / clock / AI), hold = volume");
 }

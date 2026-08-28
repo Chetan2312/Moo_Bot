@@ -13,11 +13,57 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_FREERTOS_HZ=1000
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 
+# --- Verified hardware configuration -----------------------------------
+# sdkconfig is gitignored (it holds the WiFi and Gemini secrets), so this
+# file is the only config in the repo. It must reproduce the build that was
+# actually tested, or a fresh clone gets a different device.
+
+# Speaker: LEDC PWM-DAC on the single-wire SmartElex module (GPIO 7).
+# 8-bit duty at a 312.5 kHz carrier — real PCM, no external filter, because
+# the module's own amplifier bandwidth does the reconstruction. This is the
+# backend that was tested end to end with voice.
+#
+# MOO_AUDIO_BACKEND_PDM also plays PCM on the same single wire at 16-bit,
+# but its 6.14 MHz carrier needs an RC low-pass (1k + 10nF) on SIGNAL or the
+# output is voice buried in hiss. Do not select it without fitting that.
+CONFIG_MOO_AUDIO_BACKEND_LEDC=y
+
+# Mic: bringup level monitor off for release — it logs every 200 ms.
+# Turn it back on to diagnose a dead mic.
+CONFIG_MOO_MIC_ENABLE=y
+CONFIG_MOO_MIC_MONITOR=n
+CONFIG_MOO_MIC_GAIN_SHIFT=4
+CONFIG_MOO_MIC_VAD_MARGIN_DB=10
+
+# Gemini. The API key is deliberately NOT here — set it in menuconfig, where
+# it lands in the gitignored sdkconfig. A "-latest" alias is used for the
+# text model on purpose: Google retires pinned versions to new users, and on
+# a device a stale model name costs a reflash.
+CONFIG_MOO_GEMINI_MODEL="gemini-flash-latest"
+CONFIG_MOO_GEMINI_TTS_MODEL="gemini-2.5-flash-preview-tts"
+CONFIG_MOO_GEMINI_VOICE="Puck"
+CONFIG_MOO_GEMINI_LANG="Marathi"
+CONFIG_MOO_GEMINI_MAX_WORDS=90
+
 # Partition table: app grows with sprite assets, default 1MB factory too small
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
 # LVGL
 CONFIG_LV_COLOR_DEPTH_16=y
+CONFIG_LV_FONT_MONTSERRAT_14=y
 CONFIG_LV_FONT_MONTSERRAT_20=y
 CONFIG_LV_FONT_MONTSERRAT_48=y
+CONFIG_LV_USE_QRCODE=y
+
+# On-device web server
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+
+# TLS to Google (esp_crt_bundle root CAs) for Calendar/Tasks sync
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+CONFIG_ESP_TLS_INSECURE=n
+
+# Internal RAM is scarce (WiFi+LVGL); route ALL mbedTLS allocations to the
+# 8 MB PSRAM so the TLS handshake + cert-bundle verify never starve internal RAM.
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y

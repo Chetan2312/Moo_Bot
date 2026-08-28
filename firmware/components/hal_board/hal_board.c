@@ -6,6 +6,7 @@
 #include "driver/i2c_master.h"
 #include "esp_check.h"
 #include "esp_lcd_ili9341.h"
+#include "esp_lcd_touch_xpt2046.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -25,6 +26,22 @@ static const char *TAG = "hal_board";
 #define LCD_MIRROR_Y true
 #else
 #define LCD_MIRROR_Y false
+#endif
+
+#ifdef CONFIG_MOO_TOUCH_SWAP_XY
+#define TOUCH_SWAP_XY true
+#else
+#define TOUCH_SWAP_XY false
+#endif
+#ifdef CONFIG_MOO_TOUCH_MIRROR_X
+#define TOUCH_MIRROR_X true
+#else
+#define TOUCH_MIRROR_X false
+#endif
+#ifdef CONFIG_MOO_TOUCH_MIRROR_Y
+#define TOUCH_MIRROR_Y true
+#else
+#define TOUCH_MIRROR_Y false
 #endif
 #define BL_LEDC_TIMER     LEDC_TIMER_0
 #define BL_LEDC_CHANNEL   LEDC_CHANNEL_0
@@ -80,10 +97,17 @@ esp_err_t board_lcd_init(board_lcd_t *out)
     ESP_RETURN_ON_ERROR(spi_bus_initialize(LCD_SPI_HOST, &bus_cfg, SPI_DMA_CH_AUTO),
                         TAG, "spi bus init failed");
 
+    /* DIAG: hard-capped very low to isolate signal integrity. If stripes
+     * persist even here, the fault is wiring/solder, not clock speed. */
+    int pclk_mhz = CONFIG_MOO_LCD_PCLK_MHZ;
+    if (pclk_mhz > 6) {
+        pclk_mhz = 6;
+    }
+
     const esp_lcd_panel_io_spi_config_t io_cfg = {
         .dc_gpio_num = CONFIG_MOO_PIN_LCD_DC,
         .cs_gpio_num = CONFIG_MOO_PIN_LCD_CS,
-        .pclk_hz = CONFIG_MOO_LCD_PCLK_MHZ * 1000 * 1000,
+        .pclk_hz = pclk_mhz * 1000 * 1000,
         .lcd_cmd_bits = 8,
         .lcd_param_bits = 8,
         .spi_mode = 0,
@@ -116,7 +140,7 @@ esp_err_t board_lcd_init(board_lcd_t *out)
     ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(out->panel, true), TAG, "disp on failed");
 
     ESP_LOGI(TAG, "ILI9341 up: %dx%d @ %d MHz",
-             CONFIG_MOO_LCD_H_RES, CONFIG_MOO_LCD_V_RES, CONFIG_MOO_LCD_PCLK_MHZ);
+             CONFIG_MOO_LCD_H_RES, CONFIG_MOO_LCD_V_RES, pclk_mhz);
     return ESP_OK;
 }
 
@@ -163,46 +187,72 @@ esp_err_t board_backlight_set(uint8_t percent)
 
 /* ---------------- TTP223 pat sensor ---------------- */
 
+#define PAT_HOLD_THRESH_MS 500      /* held longer than this -> hold, not tap */
+#define PAT_HOLD_TICK_MS   120      /* hold-tick cadence */
+#define PAT_BOUNCE_MS      30
+
+typedef struct { bool pressed; int64_t us; } pat_edge_t2;
+
 static QueueHandle_t s_pat_queue;
 static board_pat_cb_t s_pat_cb;
 static void *s_pat_ctx;
-static int64_t s_pat_press_us;
 
 static void IRAM_ATTR pat_isr(void *arg)
 {
     (void)arg;
-    const int64_t now = esp_timer_get_time();
-    if (gpio_get_level(CONFIG_MOO_PIN_PAT)) {
-        s_pat_press_us = now;                       /* press edge */
-        return;
-    }
-    /* release edge: report hold duration */
-    const uint32_t held_ms = (uint32_t)((now - s_pat_press_us) / 1000);
+    pat_edge_t2 e = {
+        .pressed = gpio_get_level(CONFIG_MOO_PIN_PAT) != 0,
+        .us = esp_timer_get_time(),
+    };
     BaseType_t hp_woken = pdFALSE;
-    xQueueSendFromISR(s_pat_queue, &held_ms, &hp_woken);
+    xQueueSendFromISR(s_pat_queue, &e, &hp_woken);
     portYIELD_FROM_ISR(hp_woken);
 }
 
+/* Per-press state machine: a short release is a tap; holding past the
+ * threshold emits periodic ticks then an end event on release. */
 static void pat_task(void *arg)
 {
     (void)arg;
-    uint32_t held_ms;
-    int64_t last_us = 0;
+    pat_edge_t2 e;
 
     for (;;) {
-        if (xQueueReceive(s_pat_queue, &held_ms, portMAX_DELAY) != pdTRUE) {
-            continue;
+        if (xQueueReceive(s_pat_queue, &e, portMAX_DELAY) != pdTRUE || !e.pressed) {
+            continue;                                /* wait for a press edge */
         }
-        if (held_ms < 30) {                          /* contact bounce */
-            continue;
-        }
-        const int64_t now = esp_timer_get_time();
-        if (now - last_us < (int64_t)CONFIG_MOO_PAT_COOLDOWN_MS * 1000) {
-            continue;
-        }
-        last_us = now;
-        if (s_pat_cb) {
-            s_pat_cb(s_pat_ctx, held_ms);
+        const int64_t press_us = e.us;
+        bool holding = false;
+        uint32_t timeout = PAT_HOLD_THRESH_MS;
+
+        for (;;) {
+            if (xQueueReceive(s_pat_queue, &e, pdMS_TO_TICKS(timeout)) == pdTRUE) {
+                if (e.pressed) {
+                    continue;                        /* bounce, ignore */
+                }
+                const uint32_t held = (uint32_t)((e.us - press_us) / 1000);
+                if (held < PAT_BOUNCE_MS) {
+                    break;                           /* contact bounce, discard */
+                }
+                if (s_pat_cb) {
+                    s_pat_cb(s_pat_ctx, holding ? PAT_HOLD_END : PAT_TAP, held);
+                }
+                break;
+            }
+            /* timed out — verify still held (may have missed the edge) */
+            if (gpio_get_level(CONFIG_MOO_PIN_PAT)) {
+                holding = true;
+                timeout = PAT_HOLD_TICK_MS;
+                if (s_pat_cb) {
+                    s_pat_cb(s_pat_ctx, PAT_HOLD_TICK,
+                             (uint32_t)((esp_timer_get_time() - press_us) / 1000));
+                }
+            } else {
+                const uint32_t held = (uint32_t)((esp_timer_get_time() - press_us) / 1000);
+                if (s_pat_cb && held >= PAT_BOUNCE_MS) {
+                    s_pat_cb(s_pat_ctx, holding ? PAT_HOLD_END : PAT_TAP, held);
+                }
+                break;
+            }
         }
     }
 }
@@ -213,7 +263,7 @@ esp_err_t board_pat_init(board_pat_cb_t cb, void *ctx)
     s_pat_cb = cb;
     s_pat_ctx = ctx;
 
-    s_pat_queue = xQueueCreate(4, sizeof(uint32_t));
+    s_pat_queue = xQueueCreate(8, sizeof(pat_edge_t2));
     ESP_RETURN_ON_FALSE(s_pat_queue, ESP_ERR_NO_MEM, TAG, "pat queue");
 
     const gpio_config_t cfg = {
@@ -274,6 +324,37 @@ esp_err_t board_led_off(void)
 {
     ESP_RETURN_ON_FALSE(s_strip, ESP_ERR_INVALID_STATE, TAG, "led not init");
     return led_strip_clear(s_strip);
+}
+
+/* ---------------- XPT2046 touch ---------------- */
+
+esp_err_t board_touch_init(esp_lcd_touch_handle_t *out)
+{
+    ESP_RETURN_ON_FALSE(out, ESP_ERR_INVALID_ARG, TAG, "out NULL");
+
+    esp_lcd_panel_io_handle_t tp_io;
+    const esp_lcd_panel_io_spi_config_t io_cfg =
+        ESP_LCD_TOUCH_IO_SPI_XPT2046_CONFIG(CONFIG_MOO_PIN_TOUCH_CS);
+    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_spi(LCD_SPI_HOST, &io_cfg, &tp_io),
+                        TAG, "touch io");
+
+    const esp_lcd_touch_config_t tp_cfg = {
+        .x_max = CONFIG_MOO_LCD_H_RES,
+        .y_max = CONFIG_MOO_LCD_V_RES,
+        .rst_gpio_num = -1,
+        .int_gpio_num = CONFIG_MOO_PIN_TOUCH_IRQ,
+        .flags = {
+            .swap_xy = TOUCH_SWAP_XY,
+            .mirror_x = TOUCH_MIRROR_X,
+            .mirror_y = TOUCH_MIRROR_Y,
+        },
+    };
+    ESP_RETURN_ON_ERROR(esp_lcd_touch_new_spi_xpt2046(tp_io, &tp_cfg, out),
+                        TAG, "xpt2046");
+    ESP_LOGI(TAG, "XPT2046 touch up (cs=%d irq=%d swap=%d mx=%d my=%d)",
+             CONFIG_MOO_PIN_TOUCH_CS, CONFIG_MOO_PIN_TOUCH_IRQ,
+             TOUCH_SWAP_XY, TOUCH_MIRROR_X, TOUCH_MIRROR_Y);
+    return ESP_OK;
 }
 
 /* ---------------- DS3231 RTC ---------------- */

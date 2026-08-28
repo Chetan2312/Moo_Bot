@@ -18,6 +18,7 @@ static const char *TAG = "net_sync";
 #define WIFI_MAX_RETRY 8
 
 static int s_retries;
+static net_got_ip_cb_t s_got_ip_cb;
 
 /* Debug aid on give-up: list what the radio actually sees. */
 static void scan_task(void *arg)
@@ -76,11 +77,15 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         const ip_event_got_ip_t *evt = data;
         s_retries = 0;
         ESP_LOGI(TAG, "got ip " IPSTR, IP2STR(&evt->ip_info.ip));
+        if (s_got_ip_cb) {
+            s_got_ip_cb();
+        }
     }
 }
 
-esp_err_t net_sync_start(void)
+esp_err_t net_sync_start(net_got_ip_cb_t on_got_ip)
 {
+    s_got_ip_cb = on_got_ip;
     if (strlen(CONFIG_MOO_WIFI_SSID) == 0) {
         ESP_LOGW(TAG, "no WiFi SSID configured (menuconfig -> MooBot Network) — offline");
         return ESP_ERR_INVALID_STATE;

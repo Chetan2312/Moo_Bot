@@ -1,0 +1,65 @@
+menu "MooBot Gemini"
+
+    config MOO_GEMINI_API_KEY
+        string "Gemini API key"
+        default ""
+        help
+            From aistudio.google.com/apikey. Empty = stories disabled.
+
+            This lands in firmware/sdkconfig, which .gitignore already
+            excludes — same handling as the Google OAuth client secret.
+
+            It is still readable by anyone who dumps the flash. Fine for a
+            unit on your desk; for anything you hand out, proxy Gemini
+            through your own backend and give devices a revocable token.
+
+    config MOO_GEMINI_MODEL
+        string "Model that hears the request and writes the story"
+        default "gemini-flash-latest"
+        help
+            Takes the recorded audio directly — no separate speech-to-text
+            service is involved.
+
+            Deliberately the "-latest" alias rather than a pinned version.
+            Google retires specific versions to new users (gemini-2.5-flash
+            already 404s with "no longer available to new users"), and on a
+            device a stale model name costs a reflash to fix.
+
+    config MOO_GEMINI_TTS_MODEL
+        string "Model that speaks the story"
+        default "gemini-2.5-flash-preview-tts"
+        help
+            Returns raw 24 kHz 16-bit mono PCM, which is what the speaker
+            wants. Do not point this at a model that returns MP3 — there is
+            no decoder on the device.
+
+            gemini-3.1-flash-tts-preview is the newer alternative; both were
+            verified returning 24 kHz mono L16. Swap and judge by ear.
+            There is no "-latest" alias for TTS, so this one will eventually
+            need updating by hand.
+
+    config MOO_GEMINI_VOICE
+        string "Prebuilt voice name"
+        default "Puck"
+        help
+            Puck, Kore, Charon, Fenrir, Aoede and others. Puck is bright
+            and works well for a children's story.
+
+    config MOO_GEMINI_LANG
+        string "Language to tell stories in"
+        default "Marathi"
+        help
+            Plain English name of the language, dropped into the prompt.
+            Gemini 2.5 TTS speaks 24 languages including Marathi, Hindi,
+            Bengali, Tamil and Telugu.
+
+    config MOO_GEMINI_MAX_WORDS
+        int "Story length cap (words)"
+        range 20 300
+        default 90
+        help
+            Each word costs speech time and download time. 90 words is
+            roughly 40 seconds spoken — about the ceiling of an 18-month
+            old's attention.
+
+endmenu

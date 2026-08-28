@@ -1,0 +1,39 @@
+menu "MooBot Google Sync"
+
+    config MOO_GOOGLE_CLIENT_ID
+        string "Google OAuth client ID (TV & Limited Input device)"
+        default ""
+        help
+            From Google Cloud Console. Empty = Google sync disabled.
+
+    config MOO_GOOGLE_CLIENT_SECRET
+        string "Google OAuth client secret"
+        default ""
+
+    config MOO_GSYNC_POLL_MIN
+        int "Poll interval (minutes)"
+        range 2 120
+        default 10
+
+    config MOO_GSYNC_ENABLE_TASKS
+        bool "Sync Google Tasks (needs backend-mediated OAuth)"
+        default n
+        help
+            Google Tasks is NOT reachable via the OAuth device flow — Google
+            restricts device-flow scopes and tasks.readonly is not on the
+            whitelist. Leave this OFF for the device-direct (QR/code) setup.
+            Only enable it if you add a backend that performs the auth-code
+            flow and hands the device a token carrying the tasks scope.
+
+    config MOO_TASK_REMIND_HOUR
+        int "Reminder hour for date-only tasks (0-23, local)"
+        depends on MOO_GSYNC_ENABLE_TASKS
+        range 0 23
+        default 9
+
+    config MOO_CAL_LEAD_MIN
+        int "Minutes before a calendar event to alert"
+        range 0 120
+        default 0
+
+endmenu

@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>MooBot — Habits</title>
+<style>
+  :root { --bg:#0b0f14; --card:#151b23; --line:#243040; --accent:#ff5a8a; --txt:#eaf6ff; --dim:#8fa3b0; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body { margin:0; background:var(--bg); color:var(--txt);
+         font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  header { padding:20px 16px 8px; text-align:center; }
+  header h1 { margin:0; font-size:22px; }
+  header p { margin:4px 0 0; color:var(--dim); font-size:13px; }
+  main { padding:12px 16px 40px; max-width:520px; margin:0 auto; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px;
+          padding:14px; margin-bottom:12px; }
+  label { display:block; font-size:12px; color:var(--dim); margin:10px 0 4px; }
+  input[type=text], input[type=time], select {
+    width:100%; padding:11px; border-radius:10px; border:1px solid var(--line);
+    background:#0e141b; color:var(--txt); font-size:16px; }
+  .days { display:flex; gap:6px; margin-top:6px; }
+  .days button { flex:1; padding:9px 0; border-radius:9px; border:1px solid var(--line);
+    background:#0e141b; color:var(--dim); font-size:13px; cursor:pointer; }
+  .days button.on { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .btn { width:100%; padding:13px; border:0; border-radius:11px; background:var(--accent);
+    color:#fff; font-size:16px; font-weight:600; margin-top:14px; cursor:pointer; }
+  .btn.ghost { background:transparent; border:1px solid var(--line); color:var(--dim); }
+  .habit { display:flex; align-items:center; justify-content:space-between;
+    padding:12px 0; border-bottom:1px solid var(--line); }
+  .habit:last-child { border-bottom:0; }
+  .habit .h-name { font-size:15px; }
+  .habit .h-sub { font-size:12px; color:var(--dim); margin-top:2px; }
+  .habit .h-streak { font-size:13px; color:var(--accent); margin-right:10px; }
+  .del { background:transparent; border:0; color:var(--dim); font-size:20px; cursor:pointer; }
+  .empty { color:var(--dim); text-align:center; padding:16px; font-size:14px; }
+  .row { display:flex; gap:10px; }
+  .row > * { flex:1; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🐄 MooBot</h1>
+  <p id="status">connected</p>
+</header>
+<main>
+  <div class="card">
+    <label>Habit name</label>
+    <input id="name" type="text" maxlength="23" placeholder="Read a book">
+    <div class="row">
+      <div>
+        <label>Remind at</label>
+        <input id="time" type="time" value="14:00">
+      </div>
+      <div>
+        <label>Repeat</label>
+        <select id="preset">
+          <option value="127">Every day</option>
+          <option value="62">Weekdays</option>
+          <option value="65">Weekend</option>
+          <option value="0">Custom…</option>
+        </select>
+      </div>
+    </div>
+    <div class="days" id="days"></div>
+    <button class="btn" onclick="addHabit()">Add habit</button>
+  </div>
+
+  <div class="card">
+    <div id="list"><div class="empty">Loading…</div></div>
+  </div>
+  <button class="btn ghost" onclick="clearAll()">Clear all habits</button>
+</main>
+
+<script>
+const DOW = ["Su","Mo","Tu","We","Th","Fr","Sa"];
+let mask = 127;
+
+function renderDays() {
+  const c = document.getElementById('days'); c.innerHTML = '';
+  DOW.forEach((d,i) => {
+    const b = document.createElement('button');
+    b.textContent = d;
+    if (mask & (1<<i)) b.classList.add('on');
+    b.onclick = () => { mask ^= (1<<i); document.getElementById('preset').value='0'; renderDays(); };
+    c.appendChild(b);
+  });
+}
+document.getElementById('preset').onchange = e => {
+  const v = parseInt(e.target.value);
+  if (v) { mask = v; renderDays(); }
+};
+
+function daysLabel(m) {
+  if (m === 127) return 'Every day';
+  if (m === 62) return 'Weekdays';
+  if (m === 65) return 'Weekend';
+  return DOW.filter((_,i)=>m&(1<<i)).join(' ');
+}
+
+async function load() {
+  try {
+    const r = await fetch('/api/habits'); const habits = await r.json();
+    const list = document.getElementById('list');
+    if (!habits.length) { list.innerHTML = '<div class="empty">No habits yet — add one above 🌱</div>'; return; }
+    list.innerHTML = '';
+    habits.forEach(h => {
+      const t = h.hh===255 ? 'no reminder' :
+        String(h.hh).padStart(2,'0')+':'+String(h.mm).padStart(2,'0');
+      const el = document.createElement('div'); el.className='habit';
+      el.innerHTML = `<div><div class="h-name">${h.name}</div>
+        <div class="h-sub">${daysLabel(h.days)} · ${t}</div></div>
+        <div style="display:flex;align-items:center">
+        <span class="h-streak">🔥${h.streak}</span>
+        <button class="del" onclick="del(${h.id})">✕</button></div>`;
+      list.appendChild(el);
+    });
+  } catch(e) { document.getElementById('status').textContent = 'connection lost'; }
+}
+
+async function addHabit() {
+  const name = document.getElementById('name').value.trim();
+  if (!name) { alert('Enter a habit name'); return; }
+  if (!mask) { alert('Pick at least one day'); return; }
+  const [hh,mm] = document.getElementById('time').value.split(':').map(Number);
+  await fetch('/api/habits', { method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name, days_mask:mask, remind_hh:hh, remind_mm:mm}) });
+  document.getElementById('name').value = '';
+  load();
+}
+async function del(id) {
+  await fetch('/api/habits/delete', { method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id}) });
+  load();
+}
+async function clearAll() {
+  if (!confirm('Delete all habits?')) return;
+  await fetch('/api/clear', { method:'POST' }); load();
+}
+
+renderDays(); load();
+setInterval(load, 5000);
+</script>
+</body>
+</html>

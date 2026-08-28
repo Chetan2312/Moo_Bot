@@ -1,0 +1,7 @@
+# Google OAuth client secrets — never commit
+client_secret_*.json
+
+# ESP-IDF build output & local config (holds WiFi/Google secrets via menuconfig)
+firmware/build/
+firmware/sdkconfig
+firmware/sdkconfig.old
